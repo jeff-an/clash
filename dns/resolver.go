@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Dreamacro/clash/common/cache"
@@ -39,6 +40,7 @@ type Resolver struct {
 	group                 singleflight.Group
 	lruCache              *cache.LruCache
 	policy                *trie.DomainTrie
+	searchDomains         []string
 }
 
 // LookupIP request with TypeA and TypeAAAA, priority return TypeA
@@ -291,10 +293,49 @@ func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) ([
 	}
 
 	ips := msgToIP(msg)
-	if len(ips) == 0 {
+	if len(ips) != 0 {
+		return ips, nil
+	}
+	if len(ips) == 0 && len(r.searchDomains) == 0 {
 		return nil, resolver.ErrIPNotFound
 	}
-	return ips, nil
+
+	// query search domains in parallel, taking the first result returned
+	wg := sync.WaitGroup{}
+	doneCh := make(chan struct{})
+	resultCh := make(chan []net.IP, len(r.searchDomains))
+	resultReceivedCh := make(chan struct{})
+	for _, domain := range r.searchDomains {
+		wg.Add(1)
+		go (func(d string) {
+			defer wg.Done()
+			q := &D.Msg{}
+			q.SetQuestion(D.Fqdn(fmt.Sprintf("%s.%s", host, d)), dnsType)
+			msg, err := r.Exchange(q)
+			if err != nil {
+				return
+			}
+			ips := msgToIP(msg)
+			if len(ips) != 0 {
+				resultCh <- ips
+				<-resultReceivedCh
+			}
+		})(domain)
+	}
+	go (func() {
+		wg.Wait()
+		close(doneCh)
+	})()
+
+	select {
+	case ips = <-resultCh:
+		close(resultReceivedCh)
+		return ips, nil
+	case <-doneCh:
+		break
+	}
+
+	return nil, resolver.ErrIPNotFound
 }
 
 func (r *Resolver) msgToDomain(msg *D.Msg) string {
@@ -336,6 +377,7 @@ type Config struct {
 	Pool           *fakeip.Pool
 	Hosts          *trie.DomainTrie
 	Policy         map[string]NameServer
+	SearchDomains  []string
 }
 
 func NewResolver(config Config) *Resolver {
@@ -345,10 +387,11 @@ func NewResolver(config Config) *Resolver {
 	}
 
 	r := &Resolver{
-		ipv6:     config.IPv6,
-		main:     transform(config.Main, defaultResolver),
-		lruCache: cache.New(cache.WithSize(4096), cache.WithStale(true)),
-		hosts:    config.Hosts,
+		ipv6:          config.IPv6,
+		main:          transform(config.Main, defaultResolver),
+		lruCache:      cache.New(cache.WithSize(4096), cache.WithStale(true)),
+		hosts:         config.Hosts,
+		searchDomains: config.SearchDomains,
 	}
 
 	if len(config.Fallback) != 0 {
