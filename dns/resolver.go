@@ -298,7 +298,7 @@ func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) ([
 		return nil, resolver.ErrIPNotFound
 	}
 
-	// query DNS servers in parallel for each search domain
+	// query provided search domains serially
 	for _, domain := range r.searchDomains {
 		q := &D.Msg{}
 		q.SetQuestion(D.Fqdn(fmt.Sprintf("%s.%s", host, domain)), dnsType)
