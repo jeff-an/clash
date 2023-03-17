@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Dreamacro/clash/common/cache"
@@ -287,7 +286,7 @@ func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) ([
 	query := &D.Msg{}
 	query.SetQuestion(D.Fqdn(host), dnsType)
 
-	msg, err := r.Exchange(query)
+	msg, err := r.ExchangeContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -295,44 +294,22 @@ func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) ([
 	ips := msgToIP(msg)
 	if len(ips) != 0 {
 		return ips, nil
-	}
-	if len(ips) == 0 && len(r.searchDomains) == 0 {
+	} else if len(r.searchDomains) == 0 {
 		return nil, resolver.ErrIPNotFound
 	}
 
-	// query search domains in parallel, taking the first result returned
-	wg := sync.WaitGroup{}
-	doneCh := make(chan struct{})
-	resultCh := make(chan []net.IP, len(r.searchDomains))
-	resultReceivedCh := make(chan struct{})
+	// query DNS servers in parallel for each search domain
 	for _, domain := range r.searchDomains {
-		wg.Add(1)
-		go (func(d string) {
-			defer wg.Done()
-			q := &D.Msg{}
-			q.SetQuestion(D.Fqdn(fmt.Sprintf("%s.%s", host, d)), dnsType)
-			msg, err := r.Exchange(q)
-			if err != nil {
-				return
-			}
-			ips := msgToIP(msg)
-			if len(ips) != 0 {
-				resultCh <- ips
-				<-resultReceivedCh
-			}
-		})(domain)
-	}
-	go (func() {
-		wg.Wait()
-		close(doneCh)
-	})()
-
-	select {
-	case ips = <-resultCh:
-		close(resultReceivedCh)
-		return ips, nil
-	case <-doneCh:
-		break
+		q := &D.Msg{}
+		q.SetQuestion(D.Fqdn(fmt.Sprintf("%s.%s", host, domain)), dnsType)
+		msg, err := r.ExchangeContext(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		ips := msgToIP(msg)
+		if len(ips) != 0 {
+			return ips, nil
+		}
 	}
 
 	return nil, resolver.ErrIPNotFound
